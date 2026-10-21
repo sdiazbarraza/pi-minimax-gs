@@ -8,17 +8,15 @@
 // the cause. One session burned five blind retries on it.
 //
 // What: a `tool_call` handler that inspects `collectBinding` and each item of `collectBindings` of
-// `gentle_review_capture` / `gentle_review_capture_group`, and blocks a binding that is not the
-// exact string the provider issued. Five causes are named:
+// `gentle_review_capture` / `gentle_review_capture_group`, and blocks a binding that was rewritten.
+// Four causes are named:
 //   1. a top-level scalar that mixes a string with a number or a boolean (a rewritten binding);
 //   2. the same mix inside a serialized binding whose payload was rewritten;
 //   3. a string that is not valid JSON (a mangled string, e.g. one stray closing brace);
-//   4. a binding that arrives as an object instead of the issued string;
-//   5. a binding that arrives as something other than a string or an object.
-// Cause 4 is a change of the L28 evidence: the controller matches the issued bytes, so a
-// re-serialized object copy is rejected downstream with "collectBindings must be the complete
-// distinct current reviewer group in exact provider order", after the forecast already cost a
-// call. Blocking it here names the cause instead of burning the call.
+//   4. a binding that is neither a string nor an object.
+// The object form is accepted: the tool schema takes an object or the issued string and the
+// controller accepts both. Blocking it was a false positive read from the L28 rejection, whose real
+// cause was a stale reviewer group; it cost five retries before the rule was removed.
 //
 // Never repairs a value: the original is not in the extension, so guessing one would only mint a
 // second wrong digest. The block names the key and the value and asks for a verbatim re-copy; no
@@ -47,7 +45,6 @@ export type CaptureBindingViolationKind =
 	| "retyped-scalar"
 	| "retyped-scalar-in-string"
 	| "invalid-json"
-	| "object-form"
 	| "not-a-string";
 
 export interface CaptureBindingViolation {
@@ -105,10 +102,14 @@ function bindingViolation(
 			: { field, index, kind: "retyped-scalar-in-string", key: offender.key, value: offender.value };
 	}
 	if (typeof binding === "object" && binding !== null && !Array.isArray(binding)) {
+		// The tool schema takes an object or the issued string, and the controller accepts both, so an
+		// all-string object is legitimate: only a retyped scalar inside it is a rewrite.
 		const offender = retypedBindingScalar(binding);
-		return offender === undefined
-			? { field, index, kind: "object-form" }
-			: { field, index, kind: "retyped-scalar", key: offender.key, value: offender.value };
+		return (
+			offender === undefined
+				? undefined
+				: { field, index, kind: "retyped-scalar", key: offender.key, value: offender.value }
+		);
 	}
 	return { field, index, kind: "not-a-string", detail: typeof binding };
 }
@@ -152,11 +153,6 @@ function causeSentence(violation: CaptureBindingViolation): string {
 			return (
 				`is not valid JSON (${violation.detail}): the string was mangled on the way in, ` +
 				"so the provider cannot match it"
-			);
-		case "object-form":
-			return (
-				"arrives as an object instead of the exact string the provider issued: the controller matches " +
-				"the issued bytes, so a re-serialized copy is rejected downstream"
 			);
 		case "not-a-string":
 			return `arrives as a ${violation.detail} instead of the exact string the provider issued`;
