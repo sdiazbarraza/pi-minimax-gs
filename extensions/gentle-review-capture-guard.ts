@@ -10,17 +10,19 @@
 // What: a `tool_call` handler that inspects `collectBinding` and each item of `collectBindings` of
 // `gentle_review_capture` / `gentle_review_capture_group`, and blocks a binding that was rewritten.
 // Four causes are named:
-//   1. a top-level scalar that mixes a string with a number or a boolean (a rewritten binding);
-//   2. the same mix inside a serialized binding whose payload was rewritten;
+//   1. a scalar that arrived as a number or a boolean where the contract issues a string, anywhere
+//      in the binding: MiniMax rewrites the nested `arguments[i].value` first ("0" to 0, "true" to
+//      true), and a top-level scan sees nothing;
+//   2. the same retyped scalar inside a serialized binding whose payload was rewritten;
 //   3. a string that is not valid JSON (a mangled string, e.g. one stray closing brace);
 //   4. a binding that is neither a string nor an object.
-// The object form is accepted: the tool schema takes an object or the issued string and the
-// controller accepts both. Blocking it was a false positive read from the L28 rejection, whose real
-// cause was a stale reviewer group; it cost five retries before the rule was removed.
+// The object form is accepted: the tool schema takes an object or the issued string, and the bytes
+// that reach the controller are the same either way. Whitespace is not what the controller checks;
+// only a retyped value is.
 //
-// Never repairs a value: the original is not in the extension, so guessing one would only mint a
-// second wrong digest. The block names the key and the value and asks for a verbatim re-copy; no
-// code path writes `event.input` or any binding.
+// Never repairs a value: a retyped scalar can only be restored by the agent that owns the issued
+// bytes, and guessing one would mint a second wrong binding. The block names the exact path and the
+// value and asks for a verbatim re-copy; no code path writes `event.input` or any binding.
 //
 // Scope: those two tools and those two fields only. A serialized JSON string binding is parsed to
 // validate it, but it is never re-serialized, normalized or replaced.
@@ -54,7 +56,7 @@ export interface CaptureBindingViolation {
 	readonly index: number;
 	/** Which rule fired. */
 	readonly kind: CaptureBindingViolationKind;
-	/** Key of the top-level scalar that arrived as a number or a boolean. */
+	/** Exact path of the scalar that arrived as a number or a boolean, e.g. `arguments[1].value`. */
 	readonly key?: string;
 	readonly value?: number | boolean;
 	/** Extra context: the JSON parse error, or the type of a non-string binding. */
@@ -62,17 +64,48 @@ export interface CaptureBindingViolation {
 }
 
 /**
- * The first top-level scalar of `binding` that is a number or a boolean while at least one sibling
- * is a string, or undefined when the binding carries no such mix. Pure and read-only: it writes
- * nothing, and it raises only when reading a binding throws (a hostile getter), which the caller
- * turns into a pass-through.
+ * The keys a collect binding issues as numbers by contract. Every other scalar in a binding is a
+ * string, so a number or a boolean at any other key is a retyped value and a byte mismatch. Add a
+ * key here when the contract starts issuing that field as a number.
+ */
+const NUMERIC_BINDING_KEYS: ReadonlySet<string> = new Set(["selectedOrder", "substitutionLocation"]);
+
+/**
+ * The first scalar of `binding` that arrived as a number or a boolean where the contract issues a
+ * string, named by its exact path (`arguments[1].value`), or undefined when the binding carries none.
+ * Depth matters: a tool layer that retypes strings rewrites the nested `arguments[i].value` first,
+ * where a top-level scan sees nothing. Pure and read-only: it writes nothing, and it raises only when
+ * reading a binding throws (a hostile getter), which the caller turns into a pass-through.
  */
 export function retypedBindingScalar(binding: unknown): { key: string; value: number | boolean } | undefined {
-	if (typeof binding !== "object" || binding === null || Array.isArray(binding)) return undefined;
-	const entries = Object.entries(binding as Record<string, unknown>);
-	if (!entries.some(([, value]) => typeof value === "string")) return undefined;
-	const offender = entries.find(([, value]) => typeof value === "number" || typeof value === "boolean");
-	return offender === undefined ? undefined : { key: offender[0], value: offender[1] as number | boolean };
+	return firstRetypedScalar(binding, "");
+}
+
+function firstRetypedScalar(value: unknown, path: string): { key: string; value: number | boolean } | undefined {
+	if (Array.isArray(value)) {
+		for (let index = 0; index < value.length; index += 1) {
+			const offender = firstRetypedScalar(value[index], `${path}[${index}]`);
+			if (offender !== undefined) return offender;
+		}
+		return undefined;
+	}
+	if (typeof value !== "object" || value === null) {
+		if ((typeof value === "number" || typeof value === "boolean") && !NUMERIC_BINDING_KEYS.has(keyOf(path))) {
+			return { key: path, value: value as number | boolean };
+		}
+		return undefined;
+	}
+	for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+		const offender = firstRetypedScalar(child, path === "" ? key : `${path}.${key}`);
+		if (offender !== undefined) return offender;
+	}
+	return undefined;
+}
+
+/** The last path segment of a walked path, which is the key a scalar arrived under. */
+function keyOf(path: string): string {
+	const match = /(?:^|\.)([^.[\]]+)$/.exec(path);
+	return match === null ? path : match[1];
 }
 
 /**
@@ -140,14 +173,15 @@ function causeSentence(violation: CaptureBindingViolation): string {
 	switch (violation.kind) {
 		case "retyped-scalar":
 			return (
-				`carries the ${typeof violation.value} ${String(violation.value)} at "${violation.key}" while its ` +
-				"other scalars are strings: the binding was rewritten instead of re-sent, so its digest no longer matches"
+				`carries the ${typeof violation.value} ${String(violation.value)} at "${violation.key}", where the ` +
+				"contract issues a string: the tool layer retyped it, so the binding no longer matches the bytes " +
+				"the provider issued"
 			);
 		case "retyped-scalar-in-string":
 			return (
 				`carries the ${typeof violation.value} ${String(violation.value)} at "${violation.key}" inside the ` +
-				"serialized binding while its other scalars are strings: the payload was rewritten instead of re-sent, " +
-				"so its digest no longer matches"
+				"serialized binding, where the contract issues a string: the tool layer retyped the payload, so " +
+				"it no longer matches the bytes the provider issued"
 			);
 		case "invalid-json":
 			return (

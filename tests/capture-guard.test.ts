@@ -26,6 +26,27 @@ const providerBinding = (): Record<string, unknown> => ({
   baseTree: "b".repeat(40),
 })
 
+/** A binding with the shape the provider actually issues: arguments, an artifact subject and a
+ * submission, where `selectedOrder` and `substitutionLocation` are numbers by contract. */
+const issuedBinding = () => ({
+  arguments: [
+    { name: "lineage", token: "--lineage=review-1", value: "review-1" },
+    { name: "order", token: "--order=0", value: "0" },
+    { name: "materialize", token: "--materialize=true", value: "true" },
+  ],
+  artifactSubject: { lineageId: "review-1", lens: "review-reliability", selectedOrder: 0 },
+  baseTree: "b".repeat(40),
+  candidateTree: "c".repeat(40),
+  captureOperation: "review.capture-result",
+  name: "reviewer_result",
+  schema: "https://gentle-ai.dev/schema/review/reviewer/v1",
+  submission: {
+    argumentTokens: ["--lineage=review-1"],
+    operationToken: "capture-result",
+    values: [{ domain: "artifact_path_or_stdin", slot: "reviewer_result", substitutionLocation: 8 }],
+  },
+})
+
 const captureCall = (toolName: string, binding: unknown) => ({
   toolName,
   input: { lineageId: LINEAGE, collectBinding: binding },
@@ -136,6 +157,35 @@ test("blocks a serialized binding whose payload retypes a scalar to a number", a
   assert.match(result?.reason ?? "", /\bnumber 1\b/, "reason must name the offending value")
   assert.match(result?.reason ?? "", /verbatim/i)
   assert.deepEqual(event, before, "the guard must never change the call")
+})
+
+// MiniMax retypes nested scalars, not just top-level ones: "0" arrives as 0 and "true" as true
+// inside arguments[i]. The controller then rejects the call as "missing or stale for current STATUS"
+// without naming a cause, which is the expensive way to learn the same thing.
+test("blocks a nested retyped scalar and names its exact path", async () => {
+  const run = handler()
+  const retyped = issuedBinding()
+  retyped.arguments[1] = { ...retyped.arguments[1], value: 0 }
+  retyped.arguments[2] = { ...retyped.arguments[2], value: true }
+  for (const binding of [retyped, JSON.stringify(retyped)]) {
+    const event = captureCall("gentle_review_capture", binding)
+    const before = structuredClone(event)
+    const result = (await run(event)) as { block?: boolean; reason?: string } | undefined
+    assert.equal(result?.block, true, "expected the nested retyped scalar to be blocked")
+    assert.match(result?.reason ?? "", /arguments\[1\]\.value/, "reason must name the exact path")
+    assert.match(result?.reason ?? "", /\bnumber 0\b/)
+    assert.match(result?.reason ?? "", /verbatim/i)
+    assert.deepEqual(event, before, "the guard must never change the call")
+  }
+})
+
+test("passes the fields the contract issues as numbers", async () => {
+  const run = handler()
+  for (const candidate of [issuedBinding(), JSON.stringify(issuedBinding())]) {
+    const event = captureCall("gentle_review_capture", candidate)
+    const result = await run(event)
+    assert.equal(result, undefined, `expected no block, got ${JSON.stringify(result)}`)
+  }
 })
 
 test("blocks a binding that is not a string at all", async () => {
