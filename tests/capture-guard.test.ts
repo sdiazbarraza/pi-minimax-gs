@@ -5,8 +5,9 @@ import register from "../extensions/gentle-review-capture-guard.ts"
 // Deterministic coverage for the capture-binding tripwire. The extension is loaded through its
 // default export with a fake ExtensionAPI and its registered `tool_call` handler is driven with
 // synthetic events: no model, no provider and no review authority involved. A provider-issued
-// collect binding is opaque and digest-checked, so the guard can only observe the one invariant a
-// retyped binding always breaks: provider collect inputs carry every top-level scalar as a string.
+// collect binding is opaque and digest-checked, so the guard repairs a retyped value only when the
+// binding itself proves the original — each `arguments` entry carries its own token and
+// `token === "--" + name + "=" + String(value)` — and blocks the rewrite it cannot prove.
 const LINEAGE = `lin_${"0".repeat(32)}`
 
 type Handler = (event: unknown) => unknown
@@ -162,21 +163,39 @@ test("blocks a serialized binding whose payload retypes a scalar to a number", a
 // MiniMax retypes nested scalars, not just top-level ones: "0" arrives as 0 and "true" as true
 // inside arguments[i]. The controller then rejects the call as "missing or stale for current STATUS"
 // without naming a cause, which is the expensive way to learn the same thing.
-test("blocks a nested retyped scalar and names its exact path", async () => {
+test("repairs a nested retyped scalar whose token confirms the value", async () => {
   const run = handler()
-  const retyped = issuedBinding()
-  retyped.arguments[1] = { ...retyped.arguments[1], value: 0 }
-  retyped.arguments[2] = { ...retyped.arguments[2], value: true }
-  for (const binding of [retyped, JSON.stringify(retyped)]) {
-    const event = captureCall("gentle_review_capture", binding)
-    const before = structuredClone(event)
-    const result = (await run(event)) as { block?: boolean; reason?: string } | undefined
-    assert.equal(result?.block, true, "expected the nested retyped scalar to be blocked")
-    assert.match(result?.reason ?? "", /arguments\[1\]\.value/, "reason must name the exact path")
-    assert.match(result?.reason ?? "", /\bnumber 0\b/)
-    assert.match(result?.reason ?? "", /verbatim/i)
-    assert.deepEqual(event, before, "the guard must never change the call")
-  }
+  const object = issuedBinding()
+  object.arguments[1] = { ...object.arguments[1], value: 0 }
+  object.arguments[2] = { ...object.arguments[2], value: true }
+  const event = captureCall("gentle_review_capture", object)
+  const result = await run(event)
+  assert.equal(result, undefined, `expected a pass-through, got ${JSON.stringify(result)}`)
+  assert.equal(event.input.collectBinding.arguments[1].value, "0", "the object form is repaired in place")
+  assert.equal(event.input.collectBinding.arguments[2].value, "true", "both retyped scalars are repaired")
+
+  const serialized = issuedBinding()
+  serialized.arguments[1] = { ...serialized.arguments[1], value: 0 }
+  serialized.arguments[2] = { ...serialized.arguments[2], value: true }
+  const sEvent = captureCall("gentle_review_capture", JSON.stringify(serialized))
+  const sResult = await run(sEvent)
+  assert.equal(sResult, undefined, `expected a pass-through, got ${JSON.stringify(sResult)}`)
+  const repaired = JSON.parse(sEvent.input.collectBinding)
+  assert.equal(repaired.arguments[1].value, "0", "the serialized form is re-serialized with the repair")
+  assert.equal(repaired.arguments[2].value, "true")
+})
+
+test("blocks a retyped value whose token does not confirm it", async () => {
+  const run = handler()
+  const binding = issuedBinding()
+  binding.arguments[1] = { name: "order", token: "--order=9", value: 0 }
+  const event = captureCall("gentle_review_capture", binding)
+  const before = structuredClone(event)
+  const result = (await run(event)) as { block?: boolean; reason?: string } | undefined
+  assert.equal(result?.block, true, "expected the unconfirmable retyped value to be blocked")
+  assert.match(result?.reason ?? "", /arguments\[1\]\.value/)
+  assert.match(result?.reason ?? "", /verbatim/i)
+  assert.deepEqual(event, before, "the guard must not change an unrepairable call")
 })
 
 test("passes the fields the contract issues as numbers", async () => {

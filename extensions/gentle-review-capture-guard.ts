@@ -3,34 +3,31 @@
 // 2026-10-18). Delete this file once the mirrored contract stops needing the reminder.
 //
 // Why: a provider-issued collect binding is opaque and its digest is checked by the tooling, so an
-// agent that rewrote it — putting the number 1 or the boolean true where the provider emitted the
-// string "1" or "true" — can only answer `capture-binding-rejected`, and the rejection never names
-// the cause. One session burned five blind retries on it.
+// agent that rewrote it — putting the number 0 or the boolean true where the provider emitted the
+// string "0" or "true" — can only answer `capture-binding-rejected`, and the rejection never names
+// the cause. MiniMax rewrites the nested `arguments[i].value` first, where a top-level scan sees
+// nothing, and one review burned five blind retries on it.
 //
 // What: a `tool_call` handler that inspects `collectBinding` and each item of `collectBindings` of
-// `gentle_review_capture` / `gentle_review_capture_group`, and blocks a binding that was rewritten.
-// Four causes are named:
-//   1. a scalar that arrived as a number or a boolean where the contract issues a string, anywhere
-//      in the binding: MiniMax rewrites the nested `arguments[i].value` first ("0" to 0, "true" to
-//      true), and a top-level scan sees nothing;
-//   2. the same retyped scalar inside a serialized binding whose payload was rewritten;
-//   3. a string that is not valid JSON (a mangled string, e.g. one stray closing brace);
-//   4. a binding that is neither a string nor an object.
-// The object form is accepted: the tool schema takes an object or the issued string, and the bytes
-// that reach the controller are the same either way. Whitespace is not what the controller checks;
-// only a retyped value is.
+// `gentle_review_capture` / `gentle_review_capture_group`, repairs a retyped value it can prove, and
+// blocks a binding it cannot. The proof: each entry of `arguments` carries its own token, and
+// `token === "--" + name + "=" + String(value)` holds exactly when the original value was
+// `String(value)`, so the original is read back from the binding itself, never guessed. A retyped
+// value that no token confirms, a string that is not valid JSON, and a binding that is neither a
+// string nor an object are still blocked, each with its cause named.
 //
-// Never repairs a value: a retyped scalar can only be restored by the agent that owns the issued
-// bytes, and guessing one would mint a second wrong binding. The block names the exact path and the
-// value and asks for a verbatim re-copy; no code path writes `event.input` or any binding.
+// A binding may arrive as an object or as the issued string: the tool schema takes both and the
+// controller canonicalizes both, so the object form is not a defect. An object is repaired in place;
+// a serialized string is parsed, repaired and re-serialized to the provider's canonical form
+// (compact, keys sorted), which is the byte layout the provider issues.
 //
-// Scope: those two tools and those two fields only. A serialized JSON string binding is parsed to
-// validate it, but it is never re-serialized, normalized or replaced.
+// Scope: those two tools and those two fields only. Nothing else is touched.
 //
 // Fail-open: every path is wrapped, so an internal error passes the call through unchanged and the
 // controller reports its own rejection, like gentle-review-start-repair.ts.
 //
-// Debug: `GENTLE_AI_DEBUG_BINDING_GUARD=1` writes one stderr line per block or swallowed failure.
+// Debug: `GENTLE_AI_DEBUG_BINDING_GUARD=1` writes one stderr line per repair, block or swallowed
+// failure.
 // Install: it ships inside the `pi-warden-gs` package and is registered in its `package.json`
 // (`pi.extensions`), so Pi loads `extensions/gentle-review-capture-guard.ts` from this package at
 // startup; `/reload` activates it in a session that is already open.
@@ -70,102 +67,169 @@ export interface CaptureBindingViolation {
  */
 const NUMERIC_BINDING_KEYS: ReadonlySet<string> = new Set(["selectedOrder", "substitutionLocation"]);
 
-/**
- * The first scalar of `binding` that arrived as a number or a boolean where the contract issues a
- * string, named by its exact path (`arguments[1].value`), or undefined when the binding carries none.
- * Depth matters: a tool layer that retypes strings rewrites the nested `arguments[i].value` first,
- * where a top-level scan sees nothing. Pure and read-only: it writes nothing, and it raises only when
- * reading a binding throws (a hostile getter), which the caller turns into a pass-through.
- */
-export function retypedBindingScalar(binding: unknown): { key: string; value: number | boolean } | undefined {
-	return firstRetypedScalar(binding, "");
-}
-
-function firstRetypedScalar(value: unknown, path: string): { key: string; value: number | boolean } | undefined {
-	if (Array.isArray(value)) {
-		for (let index = 0; index < value.length; index += 1) {
-			const offender = firstRetypedScalar(value[index], `${path}[${index}]`);
-			if (offender !== undefined) return offender;
-		}
-		return undefined;
-	}
-	if (typeof value !== "object" || value === null) {
-		if ((typeof value === "number" || typeof value === "boolean") && !NUMERIC_BINDING_KEYS.has(keyOf(path))) {
-			return { key: path, value: value as number | boolean };
-		}
-		return undefined;
-	}
-	for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-		const offender = firstRetypedScalar(child, path === "" ? key : `${path}.${key}`);
-		if (offender !== undefined) return offender;
-	}
-	return undefined;
-}
-
 /** The last path segment of a walked path, which is the key a scalar arrived under. */
 function keyOf(path: string): string {
 	const match = /(?:^|\.)([^.[\]]+)$/.exec(path);
 	return match === null ? path : match[1];
 }
 
+/** One repair pass: the count of retyped scalars it proved and fixed, and the first it could not. */
+interface RepairResult {
+	count: number;
+	unresolved?: { key: string; value: number | boolean };
+}
+
 /**
- * The rule that fires for one binding value, or undefined when the value is exactly what the
- * provider issued: one string that parses as JSON. Read-only: it never writes the binding.
+ * Walk a parsed binding, repairing every retyped scalar whose original can be read back from the
+ * binding itself, and reporting the first one that cannot. Mutates `value` in place. The only
+ * provable repair is an `arguments` entry whose `value` is a number or a boolean and whose `token`
+ * equals `"--" + name + "=" + String(value)`; everything else that is not a contract number is a
+ * rewrite the guard cannot restore, so it is reported instead.
  */
-function bindingViolation(
+function repairInPlace(value: unknown, path = ""): RepairResult {
+	if (Array.isArray(value)) {
+		let count = 0;
+		for (let index = 0; index < value.length; index += 1) {
+			const result = repairInPlace(value[index], `${path}[${index}]`);
+			count += result.count;
+			if (result.unresolved !== undefined) return { count, unresolved: result.unresolved };
+		}
+		return { count };
+	}
+	if (typeof value === "object" && value !== null) {
+		const record = value as Record<string, unknown>;
+		const isArgumentEntry =
+			typeof record.name === "string" &&
+			typeof record.token === "string" &&
+			(typeof record.value === "number" || typeof record.value === "boolean");
+		if (isArgumentEntry) {
+			const name = record.name as string;
+			const token = record.token as string;
+			const scalar = record.value as number | boolean;
+			if (token === `--${name}=${String(scalar)}`) {
+				record.value = String(scalar);
+				return { count: 1 };
+			}
+			return { count: 0, unresolved: { key: `${path}.value`, value: scalar } };
+		}
+		let count = 0;
+		for (const [key, child] of Object.entries(record)) {
+			const result = repairInPlace(child, path === "" ? key : `${path}.${key}`);
+			count += result.count;
+			if (result.unresolved !== undefined) return { count, unresolved: result.unresolved };
+		}
+		return { count };
+	}
+	if ((typeof value === "number" || typeof value === "boolean") && !NUMERIC_BINDING_KEYS.has(keyOf(path))) {
+		return { count: 0, unresolved: { key: path, value: value as number | boolean } };
+	}
+	return { count: 0 };
+}
+
+/** Compact JSON with keys sorted at every level, which is the byte layout the provider issues. */
+function canonicalJson(value: unknown): string {
+	if (Array.isArray(value)) {
+		return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+	}
+	if (typeof value === "object" && value !== null) {
+		const record = value as Record<string, unknown>;
+		const body = Object.keys(record)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`)
+			.join(",");
+		return `{${body}}`;
+	}
+	return JSON.stringify(value) ?? "null";
+}
+
+type CaptureOutcome =
+	| { kind: "none" }
+	| { kind: "repaired"; count: number }
+	| { kind: "block"; violation: CaptureBindingViolation };
+
+/**
+ * Repair or report one binding value. `replacement` is set only when a serialized string was parsed
+ * and re-serialized; an object is repaired in place and needs no replacement. Never throws for a
+ * value that is not a binding: a non-string non-object is a `not-a-string` violation.
+ */
+function repairOrReportOne(
 	field: "collectBinding" | "collectBindings",
 	index: number,
 	binding: unknown,
-): CaptureBindingViolation | undefined {
+): CaptureOutcome | { replacement: string } {
 	if (typeof binding === "string") {
 		let parsed: unknown;
 		try {
 			parsed = JSON.parse(binding);
 		} catch (error) {
 			return {
-				field,
-				index,
-				kind: "invalid-json",
-				detail: error instanceof Error ? error.message : String(error),
+				kind: "block",
+				violation: {
+					field,
+					index,
+					kind: "invalid-json",
+					detail: error instanceof Error ? error.message : String(error),
+				},
 			};
 		}
-		const offender = retypedBindingScalar(parsed);
-		return offender === undefined
-			? undefined
-			: { field, index, kind: "retyped-scalar-in-string", key: offender.key, value: offender.value };
+		const result = repairInPlace(parsed);
+		if (result.unresolved !== undefined) {
+			return {
+				kind: "block",
+				violation: {
+					field,
+					index,
+					kind: "retyped-scalar-in-string",
+					key: result.unresolved.key,
+					value: result.unresolved.value,
+				},
+			};
+		}
+		return result.count > 0 ? { kind: "repaired", count: result.count, replacement: canonicalJson(parsed) } : { kind: "none" };
 	}
 	if (typeof binding === "object" && binding !== null && !Array.isArray(binding)) {
-		// The tool schema takes an object or the issued string, and the controller accepts both, so an
-		// all-string object is legitimate: only a retyped scalar inside it is a rewrite.
-		const offender = retypedBindingScalar(binding);
-		return (
-			offender === undefined
-				? undefined
-				: { field, index, kind: "retyped-scalar", key: offender.key, value: offender.value }
-		);
+		const result = repairInPlace(binding);
+		if (result.unresolved !== undefined) {
+			return {
+				kind: "block",
+				violation: { field, index, kind: "retyped-scalar", key: result.unresolved.key, value: result.unresolved.value },
+			};
+		}
+		return result.count > 0 ? { kind: "repaired", count: result.count } : { kind: "none" };
 	}
-	return { field, index, kind: "not-a-string", detail: typeof binding };
+	return { kind: "block", violation: { field, index, kind: "not-a-string", detail: typeof binding } };
 }
 
 /**
- * The first retyped binding a capture call carries, or undefined when it carries none. `collectBinding`
- * is inspected first, then each item of `collectBindings` in the order the call declares them.
+ * Repair every provable rewrite a capture call carries, or report the first one it cannot. Writes
+ * the repaired input back into `input` (in place for objects, by replacement for re-serialized
+ * strings). Returns `repaired` only when the input was changed and nothing remains to block.
  */
-export function findCaptureBindingViolation(toolName: string, input: unknown): CaptureBindingViolation | undefined {
-	if (!CAPTURE_TOOLS.includes(toolName)) return undefined;
-	if (typeof input !== "object" || input === null || Array.isArray(input)) return undefined;
+function captureOutcome(toolName: string, input: unknown): CaptureOutcome {
+	if (!CAPTURE_TOOLS.includes(toolName)) return { kind: "none" };
+	if (typeof input !== "object" || input === null || Array.isArray(input)) return { kind: "none" };
 	const parameters = input as Record<string, unknown>;
+	let repaired = 0;
 	if (parameters.collectBinding !== undefined) {
-		const single = bindingViolation("collectBinding", -1, parameters.collectBinding);
-		if (single !== undefined) return single;
+		const result = repairOrReportOne("collectBinding", -1, parameters.collectBinding);
+		if (result.kind === "block") return result;
+		if (result.kind === "repaired") {
+			repaired += result.count;
+			if ("replacement" in result) parameters.collectBinding = result.replacement;
+		}
 	}
 	const group = parameters.collectBindings;
-	if (!Array.isArray(group)) return undefined;
-	for (let index = 0; index < group.length; index += 1) {
-		const offender = bindingViolation("collectBindings", index, group[index]);
-		if (offender !== undefined) return offender;
+	if (Array.isArray(group)) {
+		for (let index = 0; index < group.length; index += 1) {
+			const result = repairOrReportOne("collectBindings", index, group[index]);
+			if (result.kind === "block") return result;
+			if (result.kind === "repaired") {
+				repaired += result.count;
+				if ("replacement" in result) group[index] = result.replacement;
+			}
+		}
 	}
-	return undefined;
+	return repaired > 0 ? { kind: "repaired", count: repaired } : { kind: "none" };
 }
 
 /** The cause of one violation, in one sentence. */
@@ -174,14 +238,12 @@ function causeSentence(violation: CaptureBindingViolation): string {
 		case "retyped-scalar":
 			return (
 				`carries the ${typeof violation.value} ${String(violation.value)} at "${violation.key}", where the ` +
-				"contract issues a string: the tool layer retyped it, so the binding no longer matches the bytes " +
-				"the provider issued"
+				"contract issues a string and no token confirms the value, so the guard cannot restore it"
 			);
 		case "retyped-scalar-in-string":
 			return (
 				`carries the ${typeof violation.value} ${String(violation.value)} at "${violation.key}" inside the ` +
-				"serialized binding, where the contract issues a string: the tool layer retyped the payload, so " +
-				"it no longer matches the bytes the provider issued"
+				"serialized binding, where the contract issues a string and no token confirms the value"
 			);
 		case "invalid-json":
 			return (
@@ -189,7 +251,7 @@ function causeSentence(violation: CaptureBindingViolation): string {
 				"so the provider cannot match it"
 			);
 		case "not-a-string":
-			return `arrives as a ${violation.detail} instead of the exact string the provider issued`;
+			return `arrives as a ${violation.detail} instead of a string or an object`;
 	}
 }
 
@@ -215,9 +277,13 @@ function debugLog(message: string): void {
 export default function gentleReviewCaptureGuard(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event) => {
 		try {
-			const violation = findCaptureBindingViolation(event.toolName, event.input);
-			if (violation === undefined) return;
-			const reason = captureBindingBlockReason(event.toolName, violation);
+			const outcome = captureOutcome(event.toolName, event.input);
+			if (outcome.kind === "none") return;
+			if (outcome.kind === "repaired") {
+				debugLog(`repaired ${outcome.count} retyped scalar(s) in ${event.toolName}`);
+				return;
+			}
+			const reason = captureBindingBlockReason(event.toolName, outcome.violation);
 			debugLog(`blocked ${event.toolName}: ${reason}`);
 			return { block: true, reason };
 		} catch (error) {

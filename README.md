@@ -18,7 +18,7 @@ nothing on its own.
 | Extension | Hook | Behavior | Failure mode |
 | --- | --- | --- | --- |
 | `gentle-review-start-repair.ts` | `tool_call` | Repairs a `gentle_review` START whose `lenses`, `lensesReason` or `committedOnly` arrived mangled, and restores the top-level envelope when the parameters were relocated inside `input` | Fail-open: any internal error passes the call through unchanged |
-| `gentle-review-capture-guard.ts` | `tool_call` | Blocks a `gentle_review_capture` or `gentle_review_capture_group` call whose binding was retyped, mangled or is neither string nor object, naming one of four causes and the exact path; the object form of a binding is legitimate and passes through | Fail-open on any internal error; never writes `event.input` |
+| `gentle-review-capture-guard.ts` | `tool_call` | Repairs a `gentle_review_capture` or `gentle_review_capture_group` binding whose scalar was retyped when its own token proves the original (`token === "--" + name + "=" + String(value)`), and blocks the rewrite it cannot prove, a mangled string, or a non-string non-object, naming the exact path | Fail-open on any internal error; writes `event.input` only to restore a proven value |
 
 A `tool_call` handler runs before the tool and may mutate `event.input`; Pi performs no validation
 after that, which is why the START repair can rewrite the input and the capture guard can only
@@ -37,10 +37,11 @@ name the cause:
 - The whole tool envelope arriving with its top-level keys nested inside `input` is rejected as
   `operation: must have required properties operation`.
 - A capture binding that was retyped (`0` or `true` where the provider issued `"0"` or `"true"`,
-  usually in the nested `arguments[i].value`) or mangled (one stray closing brace) is rejected
-  downstream as `capture-binding-rejected` / "missing or stale for current STATUS", after the call was
-  already spent. The object form of a binding is not a defect: the tool schema takes an object or the
-  issued string.
+  usually in the nested `arguments[i].value`) is rejected downstream as `capture-binding-rejected` /
+  "missing or stale for current STATUS", after the call was already spent. The guard repairs it when
+  the binding proves the original — each `arguments` entry carries its own token — and blocks the
+  rewrite it cannot prove. The object form of a binding is not a defect: the tool schema takes an
+  object or the issued string.
 
 The START repair fixes the first three classes before the tool runs. The capture guard cannot repair
 a binding — it has no canonical form and its digest rejects any change — so it names the cause and
@@ -72,16 +73,17 @@ one.
 node --experimental-strip-types --test tests/*.test.ts
 ```
 
-All 22 tests pass on a clean machine. They cover the START repair (8 cases: the mangled lens shapes,
+All 23 tests pass on a clean machine. They cover the START repair (8 cases: the mangled lens shapes,
 the `committedOnly` shapes, the relocated envelope, and the calls it must leave alone) and the capture
-guard (14 cases: the four blocking causes, the nested retyped scalar and its exact path, the fields the
+guard (15 cases: the provable repair of a nested retyped scalar in the object and the serialized form,
+the block of an unconfirmable value with its exact path, the fields the
 contract issues as numbers, the group index naming, the byte-identical pass-through of
 a valid issued string and of an all-string object, the fail-open path and the debug output). Node's
 TypeScript stripping is
 experimental, so the flag is required on Node 22.
 
 Set `GENTLE_AI_DEBUG_LENS_PATCH=1` for one stderr line per executed START repair, and
-`GENTLE_AI_DEBUG_BINDING_GUARD=1` for one stderr line per blocked capture call.
+`GENTLE_AI_DEBUG_BINDING_GUARD=1` for one stderr line per repaired or blocked capture call.
 
 ## Uninstall
 
