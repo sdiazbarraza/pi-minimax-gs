@@ -10,13 +10,14 @@
   "pi": {
     "extensions": [
       "./extensions/gentle-review-start-repair.ts",
-      "./extensions/gentle-review-capture-guard.ts"
+      "./extensions/gentle-review-capture-guard.ts",
+      "./extensions/gentle-review-controller-input-repair.ts"
     ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
-  "description": "Pi package with the native-review workarounds for the MiniMax model family: a gentle_review START repair (lenses, lensesReason, committedOnly and a relocated tool envelope) and a capture-binding tripwire.",
+  "description": "Pi package with the native-review workarounds for the MiniMax model family: a gentle_review START repair (lenses, lensesReason, committedOnly and a relocated tool envelope), a capture-binding tripwire and a gentle_review controller-input repair (an input that arrived as a JSON object where the controller requires a JSON string).",
   "author": "Sebastián Díaz (https://github.com/sdiazbarraza)",
   "license": "MIT",
   "repository": {
