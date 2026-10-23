@@ -303,6 +303,94 @@ test("writes one debug line for each new violation kind", async () => {
   }
 })
 
+// The provider issues `arguments` as an array. A serializer that re-types that field sends it as
+// `{"item": [...]}` instead: the same entries under a shape the provider never issues. The guard
+// restores the array in place and lets the restored entries go through the scalar repair.
+test("restores an `arguments` array that arrived as `{\"item\": [...]}`", async () => {
+  const run = handler()
+  const binding = issuedBinding()
+  const providerArguments = binding.arguments
+  const event = captureCall("gentle_review_capture", { ...binding, arguments: { item: providerArguments } })
+  const result = await run(event)
+  assert.equal(result, undefined, `expected a pass-through, got ${JSON.stringify(result)}`)
+  const restored = (event.input.collectBinding as any).arguments
+  assert.ok(Array.isArray(restored), "the arguments field was not restored to an array")
+  assert.deepEqual(restored, providerArguments, "the restored array differs from the issued one")
+})
+
+test("restores the `arguments` array of a serialized binding and re-serializes it canonically", async () => {
+  const run = handler()
+  const binding = issuedBinding()
+  const providerArguments = binding.arguments
+  const event = captureCall("gentle_review_capture", JSON.stringify({ ...binding, arguments: { item: providerArguments } }))
+  const result = await run(event)
+  assert.equal(result, undefined, `expected a pass-through, got ${JSON.stringify(result)}`)
+  assert.equal(typeof event.input.collectBinding, "string", "the serialized form was not rewritten")
+  // The canonical form is the byte layout the provider issues: compact, keys sorted at every level.
+  const expectedCanonical =
+    `{"arguments":${JSON.stringify(providerArguments)},` +
+    `"artifactSubject":{"lens":"review-reliability","lineageId":"review-1","selectedOrder":0},` +
+    `"baseTree":"${"b".repeat(40)}","candidateTree":"${"c".repeat(40)}",` +
+    `"captureOperation":"review.capture-result","name":"reviewer_result",` +
+    `"schema":"https://gentle-ai.dev/schema/review/reviewer/v1",` +
+    `"submission":{"argumentTokens":["--lineage=review-1"],"operationToken":"capture-result",` +
+    `"values":[{"domain":"artifact_path_or_stdin","slot":"reviewer_result","substitutionLocation":8}]}}`
+  assert.equal(event.input.collectBinding, expectedCanonical, "the canonical form differs from the provider's")
+  const repaired = JSON.parse(event.input.collectBinding)
+  assert.ok(Array.isArray(repaired.arguments), "the serialized arguments field was not restored to an array")
+  assert.deepEqual(repaired.arguments, providerArguments)
+})
+
+test("repairs a retyped scalar inside a restored `arguments` array", async () => {
+  const run = handler()
+  const binding = issuedBinding()
+  binding.arguments[1] = { ...binding.arguments[1], value: 0 }
+  const event = captureCall("gentle_review_capture", { ...binding, arguments: { item: binding.arguments } })
+  const result = await run(event)
+  assert.equal(result, undefined, `expected a pass-through, got ${JSON.stringify(result)}`)
+  const restored = (event.input.collectBinding as any).arguments
+  assert.ok(Array.isArray(restored), "the arguments field was not restored to an array")
+  assert.equal(restored[1].value, "0", "the restored entry did not go through the scalar repair")
+})
+
+test("blocks an unconfirmable scalar inside a restored `arguments` array at the array path", async () => {
+  const run = handler()
+  const binding = issuedBinding()
+  binding.arguments[1] = { name: "order", token: "--order=9", value: 0 }
+  const event = captureCall("gentle_review_capture", { ...binding, arguments: { item: binding.arguments } })
+  const result = (await run(event)) as { block?: boolean; reason?: string } | undefined
+  assert.equal(result?.block, true, "expected the unconfirmable retyped value to be blocked")
+  assert.match(result?.reason ?? "", /arguments\[1\]\.value/, "the path must name the restored array, not the wrapper")
+  assert.match(result?.reason ?? "", /verbatim/i)
+})
+
+test("leaves an `arguments` object that is not the provider's shape untouched", async () => {
+  const run = handler()
+  const cases: Array<[string, unknown]> = [
+    ["another key", { other: [{ name: "order", value: "0" }] }],
+    ["extra keys", { item: [{ name: "order", value: "0" }], other: "value" }],
+    ["a non-array value", { item: "not-an-array" }],
+  ]
+  for (const [id, argumentsValue] of cases) {
+    const event = captureCall("gentle_review_capture", { ...issuedBinding(), arguments: argumentsValue })
+    const before = structuredClone(event)
+    const result = await run(event)
+    assert.equal(result, undefined, `${id}: expected no block, got ${JSON.stringify(result)}`)
+    assert.deepEqual(event, before, `${id}: expected the binding to be left as it is`)
+  }
+})
+
+test("still blocks a number at a key the contract does not issue as a number", async () => {
+  const run = handler()
+  const event = captureCall("gentle_review_capture", { ...issuedBinding(), arguments: { other: 1 } })
+  const before = structuredClone(event)
+  const result = (await run(event)) as { block?: boolean; reason?: string } | undefined
+  assert.equal(result?.block, true, "expected the retyped number to be blocked")
+  assert.match(result?.reason ?? "", /arguments\.other/, "the reason must name the offending key")
+  assert.match(result?.reason ?? "", /\bnumber 1\b/)
+  assert.deepEqual(event, before, "the guard must never change the call")
+})
+
 test("passes a correction-plan binding whose minimum and maximum are contract numbers", async () => {
   const run = handler()
   const binding = issuedBinding()

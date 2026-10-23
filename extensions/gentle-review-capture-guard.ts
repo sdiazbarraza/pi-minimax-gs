@@ -6,20 +6,26 @@
 // agent that rewrote it — putting the number 0 or the boolean true where the provider emitted the
 // string "0" or "true" — can only answer `capture-binding-rejected`, and the rejection never names
 // the cause. MiniMax rewrites the nested `arguments[i].value` first, where a top-level scan sees
-// nothing, and one review burned five blind retries on it.
+// nothing, and one review burned five blind retries on it. MiniMax also re-types the `arguments`
+// field itself into `{"item": [...]}`, a shape the provider never issues.
 //
 // What: a `tool_call` handler that inspects `collectBinding` and each item of `collectBindings` of
 // `gentle_review_capture` / `gentle_review_capture_group`, repairs a retyped value it can prove, and
-// blocks a binding it cannot. The proof: each entry of `arguments` carries its own token, and
-// `token === "--" + name + "=" + String(value)` holds exactly when the original value was
-// `String(value)`, so the original is read back from the binding itself, never guessed. A retyped
-// value that no token confirms, a string that is not valid JSON, and a binding that is neither a
-// string nor an object are still blocked, each with its cause named.
+// blocks a binding it cannot. Two repairs are provable. The scalar repair: each entry of `arguments`
+// carries its own token, and `token === "--" + name + "=" + String(value)` holds exactly when the
+// original value was `String(value)`, so the original is read back from the binding itself, never
+// guessed. The shape repair: the provider issues `arguments` as an array, so an `arguments` that
+// arrives as `{"item": [...]}` — a plain object with exactly one key, `item`, whose value is an
+// array — is a re-typed field, not a different binding; the array is restored in place and the
+// restored entries keep going through the scalar repair. Any other shape of `arguments` is left
+// exactly as it is. A retyped value that no token confirms, a string that is not valid JSON, and a
+// binding that is neither a string nor an object are still blocked, each with its cause named.
 //
 // A binding may arrive as an object or as the issued string: the tool schema takes both and the
 // controller canonicalizes both, so the object form is not a defect. An object is repaired in place;
 // a serialized string is parsed, repaired and re-serialized to the provider's canonical form
-// (compact, keys sorted), which is the byte layout the provider issues.
+// (compact, keys sorted), which is the byte layout the provider issues. The shape repair counts as
+// a repair, so a serialized binding is re-written exactly when it carried one.
 //
 // Scope: those two tools and those two fields only. Nothing else is touched.
 //
@@ -68,13 +74,34 @@ export interface CaptureBindingViolation {
  */
 const NUMERIC_BINDING_KEYS: ReadonlySet<string> = new Set(["selectedOrder", "substitutionLocation", "minimum", "maximum"]);
 
+/** The field the provider issues as an array. */
+const ARGUMENTS_KEY = "arguments";
+
+/** The only key a re-typed `arguments` wrapper carries. */
+const ARGUMENTS_WRAPPER_KEY = "item";
+
+/**
+ * True when `value` is the provider's `arguments` array that arrived re-typed: a plain object with
+ * exactly one key, `item`, whose value is an array. Any other shape is left as it is, so a field
+ * the provider never issues as an array is never reshaped on a guess.
+ */
+function isRetypedArgumentsWrapper(value: unknown): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return false;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record);
+	if (keys.length !== 1 || keys[0] !== ARGUMENTS_WRAPPER_KEY) return false;
+	return Array.isArray(record[ARGUMENTS_WRAPPER_KEY]);
+}
+
 /** The last path segment of a walked path, which is the key a scalar arrived under. */
 function keyOf(path: string): string {
 	const match = /(?:^|\.)([^.[\]]+)$/.exec(path);
 	return match === null ? path : match[1];
 }
 
-/** One repair pass: the count of retyped scalars it proved and fixed, and the first it could not. */
+/** One repair pass: the count of values it repaired (retyped scalars it proved plus a re-typed `arguments` array it restored), and the first scalar it could not. */
 interface RepairResult {
 	count: number;
 	unresolved?: { key: string; value: number | boolean };
@@ -82,10 +109,13 @@ interface RepairResult {
 
 /**
  * Walk a parsed binding, repairing every retyped scalar whose original can be read back from the
- * binding itself, and reporting the first one that cannot. Mutates `value` in place. The only
- * provable repair is an `arguments` entry whose `value` is a number or a boolean and whose `token`
- * equals `"--" + name + "=" + String(value)`; everything else that is not a contract number is a
- * rewrite the guard cannot restore, so it is reported instead.
+ * binding itself, and reporting the first one that cannot. Mutates `value` in place. Two repairs
+ * are provable: an `arguments` entry whose `value` is a number or a boolean and whose `token` equals
+ * `"--" + name + "=" + String(value)`, and the `arguments` field itself, which the provider issues
+ * as an array and which a re-typed serializer sends as `{"item": [...]}`: that array is restored in
+ * place, before the walk continues, so the restored entries keep the array path and still go
+ * through the scalar repair. Everything else that is not a contract number is a rewrite the guard
+ * cannot restore, so it is reported instead.
  */
 function repairInPlace(value: unknown, path = ""): RepairResult {
 	if (Array.isArray(value)) {
@@ -115,7 +145,18 @@ function repairInPlace(value: unknown, path = ""): RepairResult {
 		}
 		let count = 0;
 		for (const [key, child] of Object.entries(record)) {
-			const result = repairInPlace(child, path === "" ? key : `${path}.${key}`);
+			const childPath = path === "" ? key : `${path}.${key}`;
+			let next = child;
+			// A re-typed `arguments` field arrives as `{"item": [...]}`: the entries are the ones the
+			// provider issued, under a shape it never issues. The array is restored in place before
+			// the walk continues, so the restored entries keep their array path and still go through
+			// the scalar repair below.
+			if (key === ARGUMENTS_KEY && isRetypedArgumentsWrapper(child)) {
+				next = child[ARGUMENTS_WRAPPER_KEY];
+				record[key] = next;
+				count += 1;
+			}
+			const result = repairInPlace(next, childPath);
 			count += result.count;
 			if (result.unresolved !== undefined) return { count, unresolved: result.unresolved };
 		}
@@ -281,7 +322,7 @@ export default function gentleReviewCaptureGuard(pi: ExtensionAPI): void {
 			const outcome = captureOutcome(event.toolName, event.input);
 			if (outcome.kind === "none") return;
 			if (outcome.kind === "repaired") {
-				debugLog(`repaired ${outcome.count} retyped scalar(s) in ${event.toolName}`);
+				debugLog(`repaired ${outcome.count} value(s) in ${event.toolName}`);
 				return;
 			}
 			const reason = captureBindingBlockReason(event.toolName, outcome.violation);

@@ -171,6 +171,42 @@ test("leaves a payload the controller would reject untouched", async () => {
   }
 })
 
+// The controller only accepts the boolean true for `committedOnly`. A serializer that re-types the
+// field sends `"true"` or `1`, so the re-serialized payload has to carry the boolean.
+test("normalizes a retyped `committedOnly` to the boolean true in the re-serialized payload", async () => {
+  const run = handler()
+  for (const value of ["true", " TRUE ", "True", 1] as const) {
+    const event = reviewCall("status", { mode: "ordinary", committedOnly: value })
+    const result = await run(event)
+    assert.equal(result, undefined, `${JSON.stringify(value)}: the call must never be blocked`)
+    const written = (event.input as any).input
+    assert.equal(typeof written, "string", `${JSON.stringify(value)}: the object input was not re-serialized`)
+    assert.equal(JSON.parse(written).committedOnly, true, `${JSON.stringify(value)}: committedOnly was not normalized`)
+  }
+})
+
+test("leaves a `committedOnly` that is not a retyped true untouched", async () => {
+  const run = handler()
+  for (const value of [true, false, "false", "yes", 0, 2] as const) {
+    const event = reviewCall("status", { mode: "ordinary", committedOnly: value })
+    const result = await run(event)
+    assert.equal(result, undefined, `${JSON.stringify(value)}: the call must never be blocked`)
+    const written = (event.input as any).input
+    assert.equal(typeof written, "string", `${JSON.stringify(value)}: the object input was not re-serialized`)
+    assert.deepEqual(JSON.parse(written).committedOnly, value, `${JSON.stringify(value)}: committedOnly was rewritten`)
+  }
+})
+
+test("does not touch the accepted object form of start and assess", async () => {
+  const run = handler()
+  for (const operation of ["start", "assess"]) {
+    const event = reviewCall(operation, { mode: "ordinary", committedOnly: "true" })
+    const before = structuredClone(event)
+    await run(event)
+    assert.deepEqual(event, before, `${operation}: the accepted object form was rewritten`)
+  }
+})
+
 test("passes the call through unchanged when a property access throws", async () => {
   const run = handler()
   const throwingOperation: Record<string, unknown> = { input: { mode: "ordinary" } }

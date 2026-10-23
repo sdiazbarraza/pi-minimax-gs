@@ -22,9 +22,14 @@
 // and still names the cause. START and ASSESS are left alone: their object form is already
 // accepted, so repairing it would rewrite a call that works.
 //
+// One value inside the payload is normalized on the way in: `committedOnly`, which the controller
+// only accepts as the boolean true. A re-typed `"true"` (in any case, with any surrounding space)
+// or the number `1` becomes the boolean true in the payload that is re-serialized; every other
+// value, the boolean true included, stays exactly as it is.
+//
 // Scope: `gentle_review` only, and only the `input` slot of its parameters. The call is never
-// blocked, and no field inside the payload is added, removed or rewritten: the payload is
-// serialized as it stands.
+// blocked, and no field inside the payload is added, removed or renamed: the payload is serialized
+// as it stands, and `committedOnly` is the one value whose type is normalized.
 //
 // Fail-open: every path is wrapped, so an internal error passes the call through unchanged and
 // stays silent, like gentle-review-start-repair.ts and gentle-review-capture-guard.ts.
@@ -103,15 +108,34 @@ export function isProvablyLosslessJsonPayload(value: unknown): boolean {
 }
 
 /**
+ * The boolean true when `value` is a re-typed `committedOnly` the controller only accepts as the
+ * boolean true: the string `"true"` in any case and with any surrounding space, or the number 1.
+ * Every other value — including the boolean true itself — stays as it is.
+ */
+export function normalizeCommittedOnly(value: unknown): boolean | undefined {
+	if (value === true) return undefined;
+	if (typeof value === "string" && value.trim().toLowerCase() === "true") return true;
+	if (value === 1) return true;
+	return undefined;
+}
+
+/**
  * The JSON string the controller would read for this payload, or undefined when the payload is not
  * an object the controller would accept. An empty object carries no content, so it is left alone
  * as well: re-serializing it would turn "no input" into "an empty input".
+ *
+ * A re-typed `committedOnly` is normalized to the boolean true on the way in, so the payload the
+ * controller reads carries the value it accepts. No other field is added, removed or rewritten.
  */
 export function serializeControllerInputPayload(value: unknown): string | undefined {
 	if (!isProvablyLosslessJsonPayload(value)) return undefined;
 	if (Reflect.ownKeys(value as object).length === 0) return undefined;
+	let source: unknown = value;
 	try {
-		const serialized = JSON.stringify(value);
+		if (normalizeCommittedOnly((value as Record<string, unknown>).committedOnly) === true) {
+			source = { ...(value as Record<string, unknown>), committedOnly: true };
+		}
+		const serialized = JSON.stringify(source);
 		return typeof serialized === "string" ? serialized : undefined;
 	} catch {
 		return undefined;
