@@ -63,9 +63,10 @@ export interface CaptureBindingViolation {
 /**
  * The keys a collect binding issues as numbers by contract. Every other scalar in a binding is a
  * string, so a number or a boolean at any other key is a retyped value and a byte mismatch. Add a
- * key here when the contract starts issuing that field as a number.
+ * key here when the contract starts issuing that field as a number. `minimum` and `maximum` are the
+ * bounds of a correction-plan `submission.values[i]`, issued as numbers under the same gate.
  */
-const NUMERIC_BINDING_KEYS: ReadonlySet<string> = new Set(["selectedOrder", "substitutionLocation"]);
+const NUMERIC_BINDING_KEYS: ReadonlySet<string> = new Set(["selectedOrder", "substitutionLocation", "minimum", "maximum"]);
 
 /** The last path segment of a walked path, which is the key a scalar arrived under. */
 function keyOf(path: string): string {

@@ -73,14 +73,14 @@ one.
 node --experimental-strip-types --test tests/*.test.ts
 ```
 
-All 23 tests pass on a clean machine. They cover the START repair (8 cases: the mangled lens shapes,
-the `committedOnly` shapes, the relocated envelope, and the calls it must leave alone) and the capture
-guard (15 cases: the provable repair of a nested retyped scalar in the object and the serialized form,
-the block of an unconfirmable value with its exact path, the fields the
-contract issues as numbers, the group index naming, the byte-identical pass-through of
-a valid issued string and of an all-string object, the fail-open path and the debug output). Node's
-TypeScript stripping is
-experimental, so the flag is required on Node 22.
+All 24 tests pass on a clean machine. They cover the START repair (8 cases: the mangled lens
+shapes, the `committedOnly` shapes, the relocated envelope, and the calls it must leave alone) and
+the capture guard (16 cases: the provable repair of a nested retyped scalar in the object and the
+serialized form, the block of an unconfirmable value with its exact path, the fields the contract
+issues as numbers, the contract numbers of a correction-plan binding, the group index naming, the
+byte-identical pass-through of a valid issued string and of an all-string object, the fail-open path
+and the debug output). Node's TypeScript stripping is experimental, so the flag is required on Node
+22.
 
 Set `GENTLE_AI_DEBUG_LENS_PATCH=1` for one stderr line per executed START repair, and
 `GENTLE_AI_DEBUG_BINDING_GUARD=1` for one stderr line per repaired or blocked capture call.

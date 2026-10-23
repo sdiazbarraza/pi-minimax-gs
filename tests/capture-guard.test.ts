@@ -302,3 +302,14 @@ test("writes one debug line for each new violation kind", async () => {
     assert.match(lines[0]!, /^\[gentle-review-capture-guard] /, id)
   }
 })
+
+test("passes a correction-plan binding whose minimum and maximum are contract numbers", async () => {
+  const run = handler()
+  const binding = issuedBinding()
+  binding.submission.values = [{ ...binding.submission.values[0]!, maximum: 200, minimum: 1 }]
+  const event = captureCall("gentle_review_capture", binding)
+  const before = structuredClone(event)
+  const result = await run(event)
+  assert.equal(result, undefined, `expected no block, got ${JSON.stringify(result)}`)
+  assert.deepEqual(event, before)
+})
