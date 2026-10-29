@@ -2,7 +2,8 @@
 
 Local Pi extension working around `Gentleman-Programming/gentle-shell` issue #2280: an
 orchestrator whose tool-argument serialization mangles `input.lenses` (a string instead of an
-array, duplicate or non-canonical names) or sends a `lensesReason` with a newline or more than 500
+array, duplicate or non-canonical names, or the re-typed `{"item": [...]}` wrapper MiniMax emits)
+or sends a `lensesReason` with a newline or more than 500
 bytes makes `gentle_review {"operation":"start"}` fail with
 `native-start-input-invalid` / `reason: "lenses-invalid"` / `lineage_created: false`, even though
 the orchestrator did select lenses. The same family of mangling turns the boolean
@@ -24,4 +25,6 @@ file once the upstream fix for #2280 lands.
 
 Known limitation, deliberately out of scope: when a lens value is present but unusable (for example
 `"banana"`), the fallback fills all four lenses, so that call asks the provider for the full
-four-lens review.
+four-lens review. A list that arrived as `{"item": [...]}` is not affected: a plain object with
+exactly one key, `item`, whose value is an array carries the selection the orchestrator declared, so
+those lenses are restored exactly and only a wrapper with no usable name or a second key widens.

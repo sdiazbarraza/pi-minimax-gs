@@ -18,7 +18,7 @@ nothing on its own.
 
 | Extension | Hook | Behavior | Failure mode |
 | --- | --- | --- | --- |
-| `gentle-review-start-repair.ts` | `tool_call` | Repairs a `gentle_review` START whose `lenses`, `lensesReason` or `committedOnly` arrived mangled, and restores the top-level envelope when the parameters were relocated inside `input` | Fail-open: any internal error passes the call through unchanged |
+| `gentle-review-start-repair.ts` | `tool_call` | Repairs a `gentle_review` START whose `lenses`, `lensesReason` or `committedOnly` arrived mangled — including a lens list re-typed as `{"item": [...]}` — and restores the top-level envelope when the parameters were relocated inside `input` | Fail-open: any internal error passes the call through unchanged |
 | `gentle-review-capture-guard.ts` | `tool_call` | Repairs a `gentle_review_capture` or `gentle_review_capture_group` binding whose scalar was retyped when its own token proves the original (`token === "--" + name + "=" + String(value)`), and restores an `arguments` field that arrived re-typed as `{"item": [...]}` to the array the provider issues; it blocks the rewrite it cannot prove, a mangled string, or a non-string non-object, naming the exact path | Fail-open on any internal error; writes `event.input` only to restore a proven value or a proven shape |
 | `gentle-review-controller-input-repair.ts` | `tool_call` | Re-serializes a `gentle_review` `input` that arrived as a JSON object into the JSON string the controller requires, for every operation except START and ASSESS, and only when that object is provably lossless (the controller's own `serializeReviewJsonArgument` checks); a re-typed `committedOnly` becomes the boolean true in the re-serialized payload | Fail-open: any internal error passes the call through unchanged and stays silent |
 
@@ -34,6 +34,10 @@ name the cause:
 - `input.lenses` arriving as a comma string, a duplicated array or non-canonical names, or a
   `lensesReason` with a newline or more than 500 bytes, is rejected as
   `native-start-input-invalid` / `lenses-invalid` / `lineage_created: false`.
+- `input.lenses` arriving as the re-typed `{"item": [...]}` wrapper — the shape MiniMax emits — is
+  the same class, but the declared list is inside the wrapper, so restoring it exactly is possible:
+  the START repair uses the lenses inside instead of widening to all four, and widens only when the
+  wrapper carries no usable name or a second key, which is not the shape the provider re-types.
 - The boolean `input.committedOnly` arriving as `"true"` fails a committed-range START with
   `committed-only-required`.
 - The whole tool envelope arriving with its top-level keys nested inside `input` is rejected as
@@ -89,8 +93,9 @@ this one.
 node --experimental-strip-types --test tests/*.test.ts
 ```
 
-All 42 tests pass on a clean machine. They cover the START repair (8 cases: the mangled lens
-shapes, the `committedOnly` shapes, the relocated envelope, and the calls it must leave alone), the
+All 43 tests pass on a clean machine. They cover the START repair (9 cases: the mangled lens
+shapes, including a list re-typed as `{"item": [...]}`, the `committedOnly` shapes, the relocated
+envelope, and the calls it must leave alone), the
 capture guard (22 cases: the provable repair of a nested retyped scalar in the object and the
 serialized form, the restore of an `arguments` array that arrived as `{"item": [...]}` in the object
 and in the serialized form, the scalar repair of a restored entry, the block of an unconfirmable
