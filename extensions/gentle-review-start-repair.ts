@@ -2,7 +2,8 @@
 // Gentleman-Programming/gentle-shell#2280. Not an upstream fix: delete this file once it lands.
 //
 // Why: an orchestrator whose tool-argument serialization is buggy can deliver a `gentle_review`
-// START `input` where `lenses` is a string (or carries duplicate / non-canonical names), where
+// START `input` where `lenses` is a string, carries duplicate / non-canonical names, or arrives as
+// the re-typed `{"item": [...]}` wrapper (the shape MiniMax emits), where
 // `lensesReason` has a newline or more than 500 bytes, or where `committedOnly` is a string
 // ("true"). The controller then rejects the call before any authority exists: `lenses-invalid`
 // (`validateNativeStartLensSelection`, extensions/gentle-ai.ts:6495) or `committed-only-required`
@@ -37,6 +38,25 @@ const LENS_REASON_MAX_BYTES = 500;
 /** Used only when a lens selection exists but its reason does not. */
 const DEFAULT_LENSES_REASON = "lens selection repaired by the local gentle-review-start-repair extension";
 
+/** The only key a re-typed lens list carries. */
+const LENSES_WRAPPER_KEY = "item";
+
+/**
+ * True when `value` is the lens array that arrived re-typed as `{"item": [...]}`: a plain object
+ * with exactly one key, `item`, whose value is an array. The provider never issues that shape, so
+ * the array inside is the selection the orchestrator declared. Any other shape is left as it is,
+ * the same rule the capture guard applies to a re-typed `arguments` field.
+ */
+function isRetypedLensesWrapper(value: unknown): value is Record<string, unknown> {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const prototype = Object.getPrototypeOf(value);
+	if (prototype !== Object.prototype && prototype !== null) return false;
+	const record = value as Record<string, unknown>;
+	const keys = Object.keys(record);
+	if (keys.length !== 1 || keys[0] !== LENSES_WRAPPER_KEY) return false;
+	return Array.isArray(record[LENSES_WRAPPER_KEY]);
+}
+
 function debugLog(message: string): void {
 	if (process.env.GENTLE_AI_DEBUG_LENS_PATCH !== "1") return;
 	try {
@@ -59,13 +79,16 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Accepts what a mangled call can carry: an array, a JSON-encoded array string, or a
- * delimiter-separated string. Returns canonical names in NATIVE_START_LENSES order, deduplicated.
+ * Accepts what a mangled call can carry: an array, the re-typed `{"item": [...]}` wrapper, a
+ * JSON-encoded array string, or a delimiter-separated string. Returns canonical names in
+ * NATIVE_START_LENSES order, deduplicated.
  */
 export function canonicalLenses(value: unknown): string[] {
 	const candidates: unknown[] = [];
 	if (Array.isArray(value)) {
 		candidates.push(...value);
+	} else if (isRetypedLensesWrapper(value)) {
+		candidates.push(...(value[LENSES_WRAPPER_KEY] as unknown[]));
 	} else if (typeof value === "string") {
 		const text = value.trim();
 		if (text.length === 0) return [];

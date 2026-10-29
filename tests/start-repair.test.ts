@@ -74,6 +74,27 @@ test("repairs every mangled lens shape before the tool runs", async () => {
   }
 })
 
+// R8 above pins the shape whose selection cannot be read back, which widens to the native set. A
+// lens list that arrives as `{"item": [...]}` is different: the declared list is inside the
+// wrapper, so it is restored exactly — every lens the orchestrator named, and no other.
+test("restores a lens list that arrived as {\"item\": [...]}", async () => {
+  const cases = [
+    ["I1 wrapped array", { item: ["reliability"] }, ["review-reliability"]],
+    ["I2 wrapped non-canonical names", { item: [" Risk ", "RELIABILITY"] }, ["review-risk", "review-reliability"]],
+    ["I3 wrapper with no usable name", { item: ["banana"] }, LENSES],
+    ["I4 wrapper with a second key", { item: ["reliability"], other: "value" }, LENSES],
+  ] as const
+  const run = handler()
+  for (const [id, lenses, expected] of cases) {
+    const event = reviewCall("start", { mode: "ordinary", lenses, lensesReason: "changed the arithmetic of a pure function" })
+    await run(event)
+    const failure = validPayload((event.input as any).input)
+    assert.equal(failure, undefined, `${id}: ${failure}`)
+    const parsed = JSON.parse((event.input as any).input)
+    assert.deepEqual(parsed.lenses, expected, `${id}: lenses are ${JSON.stringify(parsed.lenses)}`)
+  }
+})
+
 test("leaves anything that is not a repairable ordinary START untouched", async () => {
   const cases = [
     ["U1 another tool", { toolName: "bash", input: { command: "true" } }],
